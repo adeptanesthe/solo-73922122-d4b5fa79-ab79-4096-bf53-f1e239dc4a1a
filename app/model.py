@@ -41,6 +41,19 @@ class RidgeModel:
             y += w * (x[i] - self.mean[i]) / self.std[i]
         return y
 
+    def shifted(self, offset: float) -> "RidgeModel":
+        """Same model with a constant offset added to every prediction.
+
+        Used for the per-batch power offset: shared prediction + offset.
+        """
+        return RidgeModel(
+            mean=list(self.mean),
+            std=dict(self.std),
+            weights=list(self.weights),
+            intercept=self.intercept + float(offset),
+            kept=list(self.kept),
+        )
+
     def to_dict(self) -> dict:
         return {
             "mean": list(self.mean),
@@ -85,6 +98,24 @@ def fit(mean, cov, lam: float) -> RidgeModel:
     w = np.linalg.solve(A, c)
     return RidgeModel(mean=list(mean), std=std, weights=[float(v) for v in w],
                       intercept=intercept, kept=kept)
+
+
+def mean_residual(mean, m: RidgeModel) -> float:
+    """Mean of (actual power - shared prediction) from a pooled mean vector.
+
+    mean = (mean speed, mean pressure, mean power) with the factory's
+    zero-point correction already applied to the pressure.  Because both
+    sides are means, this needs no outer-product sums: it is exactly
+    mean(y) - (b + w'E[z]).  Used to derive a batch's power offset from the
+    running report totals of a factory.
+    """
+    pred_mean = m.intercept
+    if m.kept:
+        pred_mean += sum(
+            w * (mean[i] - m.mean[i]) / m.std[i]
+            for w, i in zip(m.weights, m.kept)
+        )
+    return float(mean[TARGET] - pred_mean)
 
 
 def mse_on(st: Stats, m: RidgeModel) -> float:

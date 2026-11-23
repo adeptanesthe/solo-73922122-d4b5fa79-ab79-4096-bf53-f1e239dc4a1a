@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 
 from . import db as dbmod
-from .model import RidgeModel, train
-from .schemas import (CorrectionUpdate, CreateVersionRequest, PredictRequest)
+from .model import RidgeModel, mean_residual, mse_on, train
+from .schemas import (CorrectionUpdate, CreateVersionRequest, OpenBatchRequest,
+                      PredictRequest, ReportPayload)
 from .stats import InvalidStats, Stats, apply_correction
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join("data", "platform.db"))
@@ -122,13 +123,122 @@ def create_app(db_path: str | None = None) -> FastAPI:
                                 detail=f"{exc}; current version kept")
         return _public(store.get_version(new_id))
 
+    @app.post("/pilot/batches", status_code=201)
+    def open_batch(req: OpenBatchRequest, response: Response):
+        """Open a pilot batch; re-opening the same one returns the original.
+
+        The batch pins the current version, that version's correction for
+        the factory and a power offset = mean residual of the factory's
+        already reported summaries under that model (+ correction), or 0
+        when it has not reported yet.  Because the offset is read from the
+        running report totals, opening never scans individual reports.
+        """
+        def compute_offset(n, sums, model_dict, correction):
+            mean = [s / n for s in sums]
+            mean[1] += correction
+            return mean_residual(mean, RidgeModel.from_dict(model_dict))
+
+        try:
+            batch, created = store.open_batch(
+                req.factory_id, req.batch_id, compute_offset)
+        except dbmod.NoCurrentVersion as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except dbmod.UnknownFactory:
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown factory {req.factory_id!r}",
+            )
+        if not created:
+            response.status_code = 200
+        return batch
+
+    @app.get("/pilot/batches/{factory_id}/{batch_id}")
+    def get_batch(factory_id: str, batch_id: str):
+        """Batch pins plus its current stored report (if any)."""
+        batch = store.get_batch(factory_id, batch_id)
+        if batch is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"pilot batch {factory_id!r}/{batch_id!r} not opened",
+            )
+        return {**batch, "report": store.get_report(factory_id, batch_id)}
+
+    @app.post("/pilot/batches/{factory_id}/{batch_id}/reports")
+    def submit_report(factory_id: str, batch_id: str, req: ReportPayload):
+        """Report (or replace) a trial-run summary for a pilot batch.
+
+        Scores it with the batch's pinned version, correction and offset and
+        returns the batch's MSE before and after calibration -- in any
+        order relative to other batches.  A replacement supersedes the old
+        summary and updates the batch errors and the factory totals (so it
+        feeds the offsets of batches opened later); pins of already opened
+        batches do not change.  On failure the old summary and totals stay.
+        """
+        batch = store.get_batch(factory_id, batch_id)
+        if batch is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"pilot batch {factory_id!r}/{batch_id!r} not opened",
+            )
+        try:
+            st = apply_correction(
+                Stats.build(req.n, req.sums, req.outer), batch["correction"])
+        except InvalidStats as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        version = store.get_version(batch["version"])
+        model = RidgeModel.from_dict(version["model"])
+        mse_before = mse_on(st, model)                       # offset 0
+        mse_after = mse_on(st, model.shifted(batch["offset"]))  # calibrated
+        try:
+            result = store.submit_report(
+                factory_id, batch_id, req.n, req.sums, req.outer,
+                mse_before, mse_after)
+        except dbmod.UnknownBatch:
+            # Batch was removed concurrently (not possible via the API).
+            raise HTTPException(status_code=404,
+                                detail="pilot batch not opened")
+        report = result["report"]
+        return {
+            "factory_id": factory_id,
+            "batch_id": batch_id,
+            "version": batch["version"],
+            "correction": batch["correction"],
+            "offset": batch["offset"],
+            "n": report["n"],
+            "mse_before": report["mse_before"],
+            "mse_after": report["mse_after"],
+            "replaced": result["replaced"],
+        }
+
     @app.post("/predict")
     def predict(req: PredictRequest):
         """Predict per-minute power from raw speed/pressure readings.
 
-        Always served from the committed current version (also while a
-        recomputation is in flight); the version used is returned.
+        Without a batch_id this is served from the committed current version
+        (also while a recomputation is in flight).  With a batch_id it uses
+        that batch's pinned version, correction and offset, so older batches
+        keep their original basis after the shared model is republished.
         """
+        if req.batch_id is not None:
+            batch = store.get_batch(req.factory_id, req.batch_id)
+            if batch is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"pilot batch {req.factory_id!r}/"
+                           f"{req.batch_id!r} not opened",
+                )
+            version = store.get_version(batch["version"])
+            model = RidgeModel.from_dict(version["model"])
+            base = model.predict(req.speed,
+                                 req.pressure + batch["correction"])
+            return {
+                "factory_id": req.factory_id,
+                "batch_id": req.batch_id,
+                "power": base + batch["offset"],
+                "version": batch["version"],
+                "correction": batch["correction"],
+                "offset": batch["offset"],
+            }
         view = store.get_current()
         if view is None:
             raise HTTPException(status_code=503, detail="no model version yet")
